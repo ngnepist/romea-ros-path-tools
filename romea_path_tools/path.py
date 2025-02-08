@@ -42,6 +42,8 @@ class Path:
             return Path.from_geojson(filename)
         elif filename.endswith('.mat'):
             return Path.from_mat(filename)
+        elif filename.endswith('.json'):
+            return Path.from_json(filename)
         else:
             raise RuntimeError(f"unsupported file format for input file '{filename}'")
 
@@ -212,6 +214,38 @@ class Path:
             path.sections = list(data['sections'][:])
         return path
 
+    @staticmethod
+    def from_json(filename):
+        """ Build a path from a json agri file containing 'file_type', 'origin' 'points' and others fields.
+        """
+        path = Path()
+        path.name = os.path.basename(filename)
+
+        with open(filename, 'r') as f:
+            data = json.load(f)
+        if( ('file_type' in data) and (data['file_type'] in {'work_performed', 'mission_order'})):
+            if('origin' in data):
+                origin = data['origin']
+                if 'type' in origin:
+                    if origin['type'] != 'WGS84':
+                        raise ParseError(f"unknown origin type '{origin['type']}'; only 'WGS84' is accepted")
+                    elif ('coordinates' in origin):
+                        path.anchor = origin['coordinates']
+                    else:
+                        raise ParseError(f"field coordinates not found in origin")
+                else:
+                     raise ParseError(f"field type not found in origin")
+            else:
+                     raise ParseError(f"the field 'origin' is required in a path file")
+            if ('points' not in data):
+                raise ParseError("the field 'points' is required in a trajectory file")
+            else:
+                path.columns = data['points'][0]['columns']
+                path.points = data['points'][0]['values']
+        else:
+            raise ParseError("the field 'file_type' is required in a path file and must be work_performed or mission_order")
+        return path
+
     def positions(self):
         """ return an numpy array of (x, y) for each point """
         pts = np.array(self.points)
@@ -327,6 +361,24 @@ class Path:
                 'annotations':self.annotations, 
                 'sections': self.section_indexes()}
         savemat(filename, data)
+
+    def save_json(self, filename):
+        """ Save the in the JSON format used by romea_path """
+        data = {
+            'version': '3',
+            'origin': {
+                'type': 'WGS84',
+                'coordinates': self.anchor,
+            },
+            'points': {
+                'columns': self.columns,
+                'values': self.points,
+            },
+            'vehicle_id': "simulation",
+        }
+
+        with open(filename, 'w') as f:
+            json.dump(data, f, indent=2)
 
     def extra_columns(self):
         """ Return a dictionnary containing the columns that are not 'x' or 'y' and its values """
