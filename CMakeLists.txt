@@ -15,6 +15,11 @@ install(PROGRAMS
   scripts/convert
   scripts/show
   scripts/record
+<<<<<<< HEAD
+=======
+  scripts/path_from_swaths
+  scripts/planner
+>>>>>>> upstream/main
   DESTINATION lib/${PROJECT_NAME}
 )
 
