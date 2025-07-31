@@ -17,6 +17,7 @@ install(PROGRAMS
   scripts/record
   scripts/path_from_swaths
   scripts/planner
+  scripts/convert_file_type
   DESTINATION lib/${PROJECT_NAME}
 )
 

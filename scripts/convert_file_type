@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+import argparse
+from pymap3d import enu
+import os
+import sys
+import math
+import copy
+import json
+
+class ParseError(RuntimeError):
+    pass
+
+# local
+from romea_path_tools.path import Path
+
+def parse_args():
+  parser = argparse.ArgumentParser(
+      prog=os.path.basename(sys.argv[0]),
+      description='''\
+        Convert a json path file_type to another one.
+        The file have to be a json file. The known file_type are 
+          'mission_order' (for old romea format for trajectories),
+          'work_performed' (for the tiara format for trajectories),
+          'parcel_map' (for CSV points in east-north-up coordinates).
+      '''
+  )
+  parser.add_argument(
+      '-o', '--offset', type=float, nargs=2, default=None,
+      metavar=('x', 'y'),
+      help='an (x, y) offset to apply to the points (format: x y)'
+  )
+  parser.add_argument(
+      '-r', '--rotation', type=float, default=None, metavar="angle",
+      help='apply a rotation to the points (in degrees)'
+  )
+  parser.add_argument(
+      '-ft', '--file_type', type=str, default='mission_order', metavar="file_type",
+      choices=['mission_order', 'work_performed', 'parcel_map'],
+      help='''\
+        file_type of the generated path 
+        ['mission_order', 'work_performed', 'parcel_map'].
+        If the file_type is not specified, the file_type used is 'mission_order'.
+      '''
+  )
+  parser.add_argument(
+      '-t', '--type', type=str, default=None, metavar="type",
+      choices=['romea_v1', 'tiara', 'csv', 'kml', 'wgs84_csv', 'geojson', 'mat'],
+      help='''\
+        file format of the generated path 
+        [romea_v1, tiara, csv, kml, wgs84_csv, geojson].
+        If the format is not specified, the file extension is used.
+      '''
+  ) 
+  parser.add_argument('-f', '--force', action='store_true', help='override existing output file')
+  parser.add_argument('path_in', type=str, help="path to a '.json' path file")
+  parser.add_argument('path_out', type=str, help='generated path file')
+  args = parser.parse_args()
+  return args
+
+
+def create_points(path: Path, new_path: Path, offset: list, angle: float):
+  cos_angle = math.cos(angle)
+  sin_angle = math.sin(angle)
+
+  new_path.columns = path.columns
+
+  xi = path.columns.index('x')
+  yi = path.columns.index('y')
+
+  for point in path.points:
+    new_point = copy.copy(point)
+    new_point[xi] = offset[0] + point[xi] * cos_angle - point[yi] * sin_angle
+    new_point[yi] = offset[1] + point[xi] * sin_angle + point[yi] * cos_angle
+    new_path.points.append(new_point)
+
+  new_path.create_sections(path.section_indexes())
+
+
+def load_file(filename, path: Path, distance_before, distance_after):
+  points=[]
+  # path = Path()
+  path.name = os.path.basename(filename)
+  with open(filename, 'r') as f:
+      data = json.load(f)
+  if( ('file_type' in data) and (data['file_type'] in {'parcel_map'})):
+    if('origin' in data):
+        origin = data['origin']
+        if 'type' in origin:
+            if origin['type'] != 'WGS84':
+                raise ParseError(f"unknown origin type '{origin['type']}'; only 'WGS84' is accepted")
+            elif ('coordinates' in origin):
+                path.anchor = origin['coordinates']
+            else:
+                raise ParseError(f"field coordinates not found in origin")
+        else:
+              raise ParseError(f"field type not found in origin")
+    else:
+      raise ParseError(f"the field 'origin' is required in a path file")
+    if ('points' not in data):
+      raise ParseError("the field 'points' is required in a parcel map file")
+    else:
+      for pts in data['points']:
+        if ("x" in pts['columns']) and ("y" in pts['columns']):
+          index_x = pts['columns'].index("x")
+          index_y = pts['columns'].index("y")
+        else:
+            raise ParseError("the field 'x' or 'y' is required in all path")
+        points.append((pts['values'],index_x, index_y))
+      path_points = generate_path_points(points, distance_before, distance_after)
+      new_path.columns =["x", "y", "working_zone", "punctual"]
+      new_path.points = path_points
+  else:
+    raise ParseError("the field 'file_type' is required in a path file and must be work_performed or mission_order")
+  print("the path points",path_points)
+  return path
+
+def generate_path_points(ranks, distance_before, distance_after):
+  points = []
+  for i in range(len(ranks)):
+    rank = ranks[i]
+
+    if len(rank)>2:
+      points_of_the_rank = supprimer_points_proches(rank[0], 0.1)
+      idx_x = rank[1]
+      idx_y = rank[2]
+      for j in range(len(points_of_the_rank)-1):
+        ptA_x, ptA_y = points_of_the_rank[j][idx_x], points_of_the_rank[j][idx_y]
+        ptB_x, ptB_y = points_of_the_rank[j+1][idx_x], points_of_the_rank[j+1][idx_y]
+        # Calcul du vecteur directeur
+        dx = ptB_x  - ptA_x
+        dy = ptB_y - ptA_y
+        # Norme du vecteur
+        norm = math.sqrt(dx**2 + dy**2)
+        # Éviter une division par zéro
+        if ptB_y == ptA_y:
+          theta_rad = math.pi/2 if ptB_x > ptA_x else -math.pi/2
+        else:
+          # Calcul du cap en radians
+          theta_rad = math.atan2(dy, dx)
+        if j==0:
+          begin_point_x = ptA_x - (distance_before * dx) / norm
+          begin_point_y = ptA_y - (distance_before * dy) / norm
+          points.append([begin_point_x, begin_point_y, 0, {"course": theta_rad }])
+          points += split_line((begin_point_x,begin_point_y), (ptA_x, ptA_y), 0)
+          points += split_line((ptA_x, ptA_y), (ptB_x, ptB_y),1)
+        else:
+          points += split_line((ptA_x, ptA_y), (ptB_x, ptB_y),1)
+          if (j==len(points_of_the_rank)-2): # si c'est le dernier point, faut préparer le passage à l'autre rang
+            end_point_x = ptB_x + (distance_after * dx) / norm
+            end_point_y = ptB_y + (distance_after * dy) / norm
+            print("end_point_x, end_point_y", end_point_x, end_point_y)
+            print("ptB_x, ptB_y", ptB_x, ptB_y)
+            print("dx, dy", dx, dy)
+            print("norm", norm)
+            print("ptA_x, ptA_y", ptA_x, ptA_y)
+            points += split_line((ptB_x, ptB_y),(end_point_x, end_point_y),  0)
+            if(i<len(ranks)-1): # pour dernier point faut calculer l'angle de rotation à faire pour changer de rang
+              next_rank = ranks[i+1]
+              pts_next_rank = next_rank[0]
+              idx_x_next_rank = next_rank[1]
+              idx_y_next_rank = next_rank[2]
+              first_pt_next_rank_x, first_pt_next_rank_y  = pts_next_rank[0][idx_x_next_rank], pts_next_rank[0][idx_y_next_rank]
+              second_pt_next_rank_x, second_pt_next_rank_y  = pts_next_rank[1][idx_x_next_rank], pts_next_rank[1][idx_y_next_rank]
+              dx_next_rank = second_pt_next_rank_x - first_pt_next_rank_x
+              dy_next_rank = second_pt_next_rank_y - first_pt_next_rank_y
+              norm_next_rank = math.sqrt(dx_next_rank**2 + dy_next_rank**2)
+              begin_next_rank_x = first_pt_next_rank_x - (distance_before * dx_next_rank)/norm_next_rank
+              begin_next_rank_y = first_pt_next_rank_y - (distance_before * dy_next_rank)/norm_next_rank
+                  # Formule du cosinus
+              AB = math.sqrt((ptB_x-end_point_x)**2 + (ptB_y - end_point_y)**2)
+              AC = math.sqrt((end_point_x-begin_next_rank_x)**2 + (end_point_y-begin_next_rank_y)**2)
+              BC = math.sqrt((ptB_x-begin_next_rank_x)**2 + (ptB_y-begin_next_rank_y)**2)
+              cos_A = (AB**2 + AC**2   - BC**2 )/ (2 * AB * AC)
+              
+              # Calcul de l'angle en radians
+              A_rad = math.acos(cos_A)
+              
+              # Calcul du déterminant
+              D = (end_point_x - ptB_x) * (begin_next_rank_y - ptB_y) - (end_point_y - ptB_y) * (begin_next_rank_x - ptB_x)
+
+
+              theta_rad += math.copysign(math.pi-A_rad, D)
+              theta_rad = ((theta_rad + math.pi) % (2 * math.pi)) - math.pi # keep angle in -pi pi
+              points.append([end_point_x, end_point_y, 0, {"course": theta_rad}])
+              points += split_line((end_point_x, end_point_y), (begin_next_rank_x, begin_next_rank_y),  0)      
+    else:
+      raise ParseError("We need more than two points in a rank")
+  return points
+
+def split_line(A, B, wz):
+  points = []
+  distance = 0.1
+  x1, y1 = A
+  x2, y2 = B
+
+  # Calcul de la longueur du segment
+  d = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2) 
+
+  # Nombre de points intermédiaires (hors A et B)
+  n = int(d // distance)
+
+  for i in range(1, n + 1):
+    xi = x1 + i * (distance * (x2 - x1) / d)
+    yi = y1 + i * (distance * (y2 - y1) / d)
+    points.append([xi, yi, wz, {}])
+
+  # points.append(B)  # Ajoute B à la fin
+
+  return points
+
+def supprimer_points_proches(points, seuil):
+    resultat = []
+    for point in points:
+        if all(math.hypot(point[0] - p[0], point[1] - p[1]) >= seuil for p in resultat):
+            resultat.append(point)
+    return resultat
+
+if __name__ == "__main__":
+  args = parse_args()
+
+  if not args.force and os.path.exists(args.path_out):
+    print(f"[error] Failed to create file '{args.path_out}': file already exists", file=sys.stderr)
+    if input("Do you want to override it? [y/N] ") not in ['y', 'Y', 'o', 'O']:
+      exit(1)
+  if not args.path_in.endswith('.json'):
+     print(f"[error] The file have to be a json file '{args.path_in}': file is not a json format", file=sys.stderr)
+
+
+
+  # path = Path.load(args.path_in)
+  new_path = Path()
+  load_file(args.path_in, new_path, 1.5, 1.0)
+
+  offset = [0., 0.]
+
+  if args.rotation:
+    angle = args.rotation * math.pi / 180.
+  else:
+    angle = 0.
+
+  if args.offset:
+    offset = args.offset
+
+  # if args.anchor:
+  #   new_path.anchor = args.anchor
+  #   anchor = path.anchor
+  #   new_anchor = new_path.anchor
+
+  #   print(f'current anchor: {anchor}')
+  #   print(f'new anchor: {new_anchor}')
+
+  #   e, n, u = enu.geodetic2enu(
+  #       anchor[0], anchor[1], anchor[2],
+  #       new_anchor[0], new_anchor[1], new_anchor[2])
+  #   offset[0] += e
+  #   offset[1] += n
+  #   print(f'offset: {offset}')
+
+  # else:
+    new_path.anchor = path.anchor
+
+  # create_points(path, new_path, offset, angle)
+  # new_path.annotations = copy.copy(path.annotations)
+
+  if args.type:
+    if args.type == 'csv':
+      new_path.save_csv(args.path_out)
+    elif args.type == 'kml':
+      new_path.save_kml(args.path_out)
+    elif args.type == 'wgs84_csv':
+      new_path.save_wgs84_csv(args.path_out)
+    elif args.type == 'geojson':
+      new_path.save_geojson(args.path_out)
+    elif args.type == 'romea_v1':
+      print("[error] output format 'romea_v1' is not supported", file=sys.stderr)
+    elif args.type == 'mat':
+      new_path.save_mat(args.path_out)
+    elif args.type == 'json':
+      new_path.save_json(args.path_out)
+    else:
+      new_path.save(args.path_out)
+  else:
+    if args.path_out.endswith('wgs84.csv'):
+      new_path.save_wgs84_csv(args.path_out)
+    elif args.path_out.endswith('.csv'):
+      new_path.save_csv(args.path_out)
+    elif args.path_out.endswith('.kml'):
+      new_path.save_kml(args.path_out)
+    elif args.path_out.endswith('.geojson'):
+      new_path.save_geojson(args.path_out)
+    elif args.path_out.endswith('.txt'):
+      print("[error] output format 'romea_v1' is not supported", file=sys.stderr)
+    elif args.path_out.endswith('.traj'):
+      new_path.save(args.path_out)
+    elif args.path_out.endswith('.mat'):
+      new_path.save_mat(args.path_out)
+    elif args.path_out.endswith('.json'):
+      new_path.save_json(args.path_out)
+    else:
+      print(f"[error] unknown file extension for '{args.path_out}'", file=sys.stderr)

@@ -223,7 +223,7 @@ class Path:
 
         with open(filename, 'r') as f:
             data = json.load(f)
-        if( ('file_type' in data) and (data['file_type'] in {'work_performed', 'mission_order'})):
+        if( ('file_type' in data) and (data['file_type'] in {'work_performed', 'mission_order', 'parcel_map'})):
             if('origin' in data):
                 origin = data['origin']
                 if 'type' in origin:
@@ -364,16 +364,23 @@ class Path:
 
     def save_json(self, filename):
         """ Save the in the JSON format used by romea_path """
+        print("self.anchor", self.anchor)
         data = {
+            'file_type' : 'mission_order',
             'version': '3',
             'origin': {
                 'type': 'WGS84',
-                'coordinates': self.anchor,
+                'coordinates': self.anchor
+                # {
+                #     "lat":self.anchor[0]
+                #     "lon":self.anchor[1]
+                # },
             },
-            'points': {
-                'columns': self.columns,
-                'values': self.points,
-            },
+            'points': 
+                [
+                {'columns': self.columns,
+                'values': self.points}]
+            ,
             'vehicle_id': "simulation",
         }
 
