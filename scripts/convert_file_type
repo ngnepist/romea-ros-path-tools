@@ -6,6 +6,7 @@ import sys
 import math
 import copy
 import json
+import numpy as np  
 
 class ParseError(RuntimeError):
     pass
@@ -58,7 +59,7 @@ def parse_args():
   return args
 
 
-def create_points(path: Path, new_path: Path, offset: list, angle: float):
+def create_points(path: Path, new_path: Path, offset: list, angle: float, ):
   cos_angle = math.cos(angle)
   sin_angle = math.sin(angle)
 
@@ -76,7 +77,7 @@ def create_points(path: Path, new_path: Path, offset: list, angle: float):
   new_path.create_sections(path.section_indexes())
 
 
-def load_file(filename, path: Path, distance_before, distance_after):
+def load_file(filename, path: Path, distance_before: float, distance_after: float, l: float, r: float, with_avoidance: bool = False):
   points=[]
   # path = Path()
   path.name = os.path.basename(filename)
@@ -106,12 +107,15 @@ def load_file(filename, path: Path, distance_before, distance_after):
         else:
             raise ParseError("the field 'x' or 'y' is required in all path")
         points.append((pts['values'],index_x, index_y))
-      path_points = generate_path_points(points, distance_before, distance_after)
+      if with_avoidance:
+        path_points = generate_path_points_with_avoidance(points, distance_before, distance_after, l, r)
+      else:
+        path_points = generate_path_points(points, distance_before, distance_after)
       new_path.columns =["x", "y", "working_zone", "punctual"]
       new_path.points = path_points
   else:
     raise ParseError("the field 'file_type' is required in a path file and must be work_performed or mission_order")
-  print("the path points",path_points)
+  # print("the path points",path_points)
   return path
 
 def generate_path_points(ranks, distance_before, distance_after):
@@ -138,22 +142,21 @@ def generate_path_points(ranks, distance_before, distance_after):
           # Calcul du cap en radians
           theta_rad = math.atan2(dy, dx)
         if j==0:
-          begin_point_x = ptA_x - (distance_before * dx) / norm
-          begin_point_y = ptA_y - (distance_before * dy) / norm
+          begin_point_x_wz, begin_point_y_wz = ptA_x-(distance_before * dx) / norm, ptA_y-(distance_before * dy) / norm
+          begin_point_x = begin_point_x_wz - (distance_before * dx) / norm
+          begin_point_y = begin_point_y_wz - (distance_before * dy) / norm
           points.append([begin_point_x, begin_point_y, 0, {"course": theta_rad }])
-          points += split_line((begin_point_x,begin_point_y), (ptA_x, ptA_y), 0)
+          points += split_line((begin_point_x,begin_point_y), (begin_point_x_wz, begin_point_y_wz), 0)
+          points += split_line((begin_point_x_wz,begin_point_y_wz), (ptA_x, ptA_y), 1)
           points += split_line((ptA_x, ptA_y), (ptB_x, ptB_y),1)
         else:
           points += split_line((ptA_x, ptA_y), (ptB_x, ptB_y),1)
           if (j==len(points_of_the_rank)-2): # si c'est le dernier point, faut préparer le passage à l'autre rang
-            end_point_x = ptB_x + (distance_after * dx) / norm
-            end_point_y = ptB_y + (distance_after * dy) / norm
-            print("end_point_x, end_point_y", end_point_x, end_point_y)
-            print("ptB_x, ptB_y", ptB_x, ptB_y)
-            print("dx, dy", dx, dy)
-            print("norm", norm)
-            print("ptA_x, ptA_y", ptA_x, ptA_y)
-            points += split_line((ptB_x, ptB_y),(end_point_x, end_point_y),  0)
+            end_point_x_wz, end_point_y_wz = ptB_x + (distance_after * dx) / norm, ptB_y + (distance_after * dy) / norm
+            end_point_x = end_point_x_wz + (distance_after * dx) / norm
+            end_point_y = end_point_y_wz + (distance_after * dy) / norm
+            points += split_line((ptB_x, ptB_y), (end_point_x_wz, end_point_y_wz), 1)
+            points += split_line((end_point_x_wz, end_point_y_wz),(end_point_x, end_point_y),  0)
             if(i<len(ranks)-1): # pour dernier point faut calculer l'angle de rotation à faire pour changer de rang
               next_rank = ranks[i+1]
               pts_next_rank = next_rank[0]
@@ -164,8 +167,8 @@ def generate_path_points(ranks, distance_before, distance_after):
               dx_next_rank = second_pt_next_rank_x - first_pt_next_rank_x
               dy_next_rank = second_pt_next_rank_y - first_pt_next_rank_y
               norm_next_rank = math.sqrt(dx_next_rank**2 + dy_next_rank**2)
-              begin_next_rank_x = first_pt_next_rank_x - (distance_before * dx_next_rank)/norm_next_rank
-              begin_next_rank_y = first_pt_next_rank_y - (distance_before * dy_next_rank)/norm_next_rank
+              begin_next_rank_x = first_pt_next_rank_x - (2*distance_before * dx_next_rank)/norm_next_rank
+              begin_next_rank_y = first_pt_next_rank_y - (2*distance_before * dy_next_rank)/norm_next_rank
                   # Formule du cosinus
               AB = math.sqrt((ptB_x-end_point_x)**2 + (ptB_y - end_point_y)**2)
               AC = math.sqrt((end_point_x-begin_next_rank_x)**2 + (end_point_y-begin_next_rank_y)**2)
@@ -185,6 +188,178 @@ def generate_path_points(ranks, distance_before, distance_after):
               points += split_line((end_point_x, end_point_y), (begin_next_rank_x, begin_next_rank_y),  0)      
     else:
       raise ParseError("We need more than two points in a rank")
+  return points
+
+def generate_path_points_with_avoidance(ranks, distance_before, distance_after, blade_length, transition_radius):
+  points = []
+  for i in range(len(ranks)):
+    rank = ranks[i]
+    
+    if len(rank)>2:
+      points_of_the_rank = supprimer_points_proches(rank[0], 0.1)
+      idx_x = rank[1]
+      idx_y = rank[2]
+      for j in range(len(points_of_the_rank)-1):
+        ptA_x, ptA_y = points_of_the_rank[j][idx_x], points_of_the_rank[j][idx_y]
+        ptB_x, ptB_y = points_of_the_rank[j+1][idx_x], points_of_the_rank[j+1][idx_y]
+        # Calcul du vecteur directeur
+        dx = ptB_x  - ptA_x
+        dy = ptB_y - ptA_y
+        # Norme du vecteur
+        norm = math.sqrt(dx**2 + dy**2)
+        # Éviter une division par zéro
+        if ptB_y == ptA_y:
+          theta_rad = math.pi/2 if ptB_x > ptA_x else -math.pi/2
+        else:
+          # Calcul du cap en radians
+          theta_rad = math.atan2(dy, dx)
+        if j==0:
+          begin_point_x_wz, begin_point_y_wz = ptA_x-(distance_before * dx) / norm, ptA_y-(distance_before * dy) / norm
+          begin_point_x = begin_point_x_wz - (distance_before * dx) / norm
+          begin_point_y = begin_point_y_wz - (distance_before * dy) / norm
+          points.append([begin_point_x, begin_point_y, 0, {"course": theta_rad }])
+          points += split_line((begin_point_x,begin_point_y), (begin_point_x_wz, begin_point_y_wz), 0)
+          point_A2, point_A1, point_omega_A = generate_end_avoidment((begin_point_x_wz, begin_point_y_wz), (ptA_x, ptA_y), blade_length, transition_radius)
+          points += split_line((begin_point_x_wz, begin_point_y_wz), point_A2, 1)
+          points += split_circle(point_A2, point_A1, point_omega_A, 1, sens=-1)
+      
+        point_B2, point_B1, point_omega_B = generate_begin_avoidment((ptA_x, ptA_y), (ptB_x, ptB_y), blade_length, transition_radius)
+        points += split_circle(point_A1, point_B1, (ptA_x, ptA_y), 1, sens=1)
+        points += split_circle(point_B1, point_B2, point_omega_B, 1, sens=-1)
+        point_A2, point_A1, point_omega_A = generate_end_avoidment((ptA_x, ptA_y), (ptB_x, ptB_y), blade_length, transition_radius)
+        points += split_line(point_B2, point_A2,1)
+        points += split_circle(point_A2, point_A1, point_omega_A, 1, sens=-1)
+
+        if (j==len(points_of_the_rank)-2): # si c'est le dernier point, faut préparer le passage à l'autre rang
+          end_point_x_wz, end_point_y_wz = ptB_x + (distance_after * dx) / norm, ptB_y + (distance_after * dy) / norm
+          end_point_x = end_point_x_wz + (distance_after * dx) / norm
+          end_point_y = end_point_y_wz + (distance_after * dy) / norm
+          point_B2, point_B1, point_omega_B = generate_begin_avoidment((ptB_x, ptB_y), (end_point_x_wz, end_point_y_wz), blade_length, transition_radius)
+          points += split_circle(point_A1, point_B1, (ptB_x, ptB_y), 1, sens=1)
+          points += split_circle(point_B1, point_B2, point_omega_B, 1, sens=-1)
+          points += split_line(point_B2, (end_point_x_wz, end_point_y_wz), 1)
+          points += split_line((end_point_x_wz, end_point_y_wz),(end_point_x, end_point_y),  0)
+          if(i<len(ranks)-1): # pour dernier point faut calculer l'angle de rotation à faire pour changer de rang
+            next_rank = ranks[i+1]
+            pts_next_rank = next_rank[0]
+            idx_x_next_rank = next_rank[1]
+            idx_y_next_rank = next_rank[2]
+            first_pt_next_rank_x, first_pt_next_rank_y  = pts_next_rank[0][idx_x_next_rank], pts_next_rank[0][idx_y_next_rank]
+            second_pt_next_rank_x, second_pt_next_rank_y  = pts_next_rank[1][idx_x_next_rank], pts_next_rank[1][idx_y_next_rank]
+            dx_next_rank = second_pt_next_rank_x - first_pt_next_rank_x
+            dy_next_rank = second_pt_next_rank_y - first_pt_next_rank_y
+            norm_next_rank = math.sqrt(dx_next_rank**2 + dy_next_rank**2)
+            begin_next_rank_x = first_pt_next_rank_x - (2*distance_before * dx_next_rank)/norm_next_rank
+            begin_next_rank_y = first_pt_next_rank_y - (2*distance_before * dy_next_rank)/norm_next_rank
+            # Formule du cosinus
+            AB = math.sqrt((ptB_x-end_point_x)**2 + (ptB_y - end_point_y)**2)
+            AC = math.sqrt((end_point_x-begin_next_rank_x)**2 + (end_point_y-begin_next_rank_y)**2)
+            BC = math.sqrt((ptB_x-begin_next_rank_x)**2 + (ptB_y-begin_next_rank_y)**2)
+            cos_A = (AB**2 + AC**2   - BC**2 )/ (2 * AB * AC)
+            
+            # Calcul de l'angle en radians
+            A_rad = math.acos(cos_A)
+            
+            # Calcul du déterminant
+            D = (end_point_x - ptB_x) * (begin_next_rank_y - ptB_y) - (end_point_y - ptB_y) * (begin_next_rank_x - ptB_x)
+
+            theta_rad += math.copysign(math.pi-A_rad, D)
+            theta_rad = ((theta_rad + math.pi) % (2 * math.pi)) - math.pi # keep angle in -pi pi
+            points.append([end_point_x, end_point_y, 0, {"course": theta_rad}])
+            points += split_line((end_point_x, end_point_y), (begin_next_rank_x, begin_next_rank_y),  0) 
+    else:
+      raise ParseError("We need more than two points in a rank")
+  return points
+
+def generate_begin_avoidment(ptB, ptA, blade_length, transition_radius):
+  r = transition_radius
+  l = blade_length
+  dx = ptB[0] - ptA[0]
+  dy = ptB[1] - ptA[1]
+  R = math.sqrt(dx**2 + dy**2)
+  if ptA[0] == ptB[0]:  # vertical line
+    #coordinates of omega_B
+    omega_B_x = ptB[0]  - r*R / (ptA[1]- ptB[1])
+    omega_B_y = ptB[1] + math.sqrt((l+r)**2 - ((r*R)**2)/((ptA[1]- ptB[1])**2))
+    condition = (omega_B_x-ptB[0]) * (ptA[0] - ptB[0]) + (omega_B_y-ptB[1]) * (ptA[1] - ptB[1]) >=0
+    if not condition:
+      omega_B_y = ptB[1] - math.sqrt((l+r)**2 - ((r*R)**2)/((ptA[1]- ptB[1])**2))
+
+    x_B2 = ptB[0]
+    y_B2 = omega_B_y
+  else:
+    omega_B_x = ptB[0] + (- math.sqrt(((ptB[0] - ptA[0])**2) * (l+ 2*r)* l) - (ptA[1]-ptB[1])*r)/(R)
+    omega_B_y = ptB[1] + (- (ptA[1] - ptB[1]) * math.sqrt(((ptA[0] - ptB[0])**2)*(l + 2*r)*l) + ((ptA[0] - ptB[0])**2)*r)/((ptA[0] - ptB[0]) * R)
+    condition = (omega_B_x-ptB[0]) * (ptA[0] - ptB[0]) + (omega_B_y-ptB[1]) * (ptA[1] - ptB[1]) >=0
+    if not condition:
+      omega_B_x = ptB[0] + (+ math.sqrt(((ptB[0] - ptA[0])**2) * (l+ 2*r)* l) - (ptA[1]-ptB[1])*r)/(R)
+      omega_B_y = ptB[1] + (+ (ptA[1] - ptB[1]) * math.sqrt(((ptA[0] - ptB[0])**2)*(l + 2*r)*l) + ((ptA[0] - ptB[0])**2)*r)/((ptA[0] - ptB[0]) * R)
+    
+    x_B2 = (omega_B_x*((ptA[0]-ptB[0])**2) + (ptA[1]-ptB[1])*((ptA[0]-ptB[0])*omega_B_y - ptA[0] * ptB[1] + ptA[1] * ptB[0]))/((R**2))
+    y_B2 = (omega_B_y*((ptA[1]-ptB[1])**2) + (ptA[0]-ptB[0])*((ptA[1]-ptB[1])*omega_B_x + ptA[0] * ptB[1] - ptA[1] * ptB[0]))/((R**2))
+    
+  x_B1 = ptB[0] + l * (omega_B_x - ptB[0]) / (l + r )
+  y_B1 = ptB[1] + l * (omega_B_y - ptB[1]) / (l + r )
+
+  return (x_B2, y_B2), (x_B1, y_B1), (omega_B_x, omega_B_y)
+
+def generate_end_avoidment(ptB, ptA, blade_length, transition_radius):
+  r = transition_radius
+  l = blade_length
+  dx = ptB[0] - ptA[0]
+  dy = ptB[1] - ptA[1]
+  R = math.sqrt(dx**2 + dy**2)
+  a, A = ptA[0], ptA[1]
+  b, B = ptB[0], ptB[1]
+  if a == b:  # vertical line
+    omega_A_x = a - r*R / (A - B)
+    omega_A_y = A - math.sqrt((l+r)**2 - ((r*R)**2)/((A - B)**2))
+    condition = (omega_A_x-a) * (a - b) + (omega_A_y-A) * (A - B) >=0
+    if not condition:
+      omega_A_y = A + math.sqrt((l+r)**2 - ((r*R)**2)/((A - B)**2))
+
+    x_A2 = a
+    y_A2 = omega_A_y
+  else:
+    omega_A_x = a + (- math.sqrt(((b - a)**2) * (l+ 2*r)* l) - (A-B)*r)/(R)
+    omega_A_y = A + (- (A - B) * math.sqrt(((a - b)**2)*(l + 2*r)*l) + ((a - b)**2)*r)/((a - b) * R)
+    condition = (omega_A_x-a) * (a - b) + (omega_A_y-A) * (A - B) <=0
+    if not condition:
+      omega_A_x = a + (math.sqrt(((b - a)**2) * (l+ 2*r)* l) - (A-B)*r)/(R)
+      omega_A_y = A + ((A - B) * math.sqrt(((a - b)**2)*(l + 2*r)*l) + ((a - b)**2)*r)/((a - b) * R)
+
+    x_A2 = (omega_A_x*((b-a)**2) + (A-B)*((a-b)*omega_A_y - a * B + A * b))/((R**2))
+    y_A2 = (omega_A_y*((B-A)**2) + (a-b)*((A-B)*omega_A_x + a * B - A * b))/((R**2))
+    
+  x_A1 = a + l * (omega_A_x - a) / (l + r)
+  y_A1 = A + l * (omega_A_y - A) / (l + r)
+
+  return (x_A2, y_A2), (x_A1, y_A1), (omega_A_x, omega_A_y)
+
+def split_circle(A, B, O, wz, sens = 1, distance=0.1):
+  points = []
+  x1, y1 = A
+  x2, y2 = B
+  ox, oy = O
+  R = math.sqrt((x1 - ox) ** 2 + (y1 - oy) ** 2)
+
+  # Calcul de l'angle entre A et B
+  angle_A = math.atan2(y1 - oy, x1 - ox)
+  angle_B = math.atan2(y2 - oy, x2 - ox)
+  
+  delta_angle =sens*(angle_A - angle_B)
+  if delta_angle < 0:
+    delta_angle += 2 * math.pi
+
+  # Nombre de points intermédiaires (hors A et B)
+  n = int(abs(angle_A - angle_B) // (distance / R))
+
+  for i in range(0, n + 1):
+    angle_i = angle_A - sens * i * delta_angle/n
+    xi = ox + R * math.cos(angle_i)
+    yi = oy + R * math.sin(angle_i)
+    points.append([xi, yi, wz, {}])
+
   return points
 
 def split_line(A, B, wz):
@@ -225,11 +400,8 @@ if __name__ == "__main__":
   if not args.path_in.endswith('.json'):
      print(f"[error] The file have to be a json file '{args.path_in}': file is not a json format", file=sys.stderr)
 
-
-
-  # path = Path.load(args.path_in)
   new_path = Path()
-  load_file(args.path_in, new_path, 1.5, 1.0)
+  load_file(args.path_in, new_path, 1., 1.0, 0.2, 0.2, with_avoidance=True)
 
   offset = [0., 0.]
 
@@ -240,27 +412,7 @@ if __name__ == "__main__":
 
   if args.offset:
     offset = args.offset
-
-  # if args.anchor:
-  #   new_path.anchor = args.anchor
-  #   anchor = path.anchor
-  #   new_anchor = new_path.anchor
-
-  #   print(f'current anchor: {anchor}')
-  #   print(f'new anchor: {new_anchor}')
-
-  #   e, n, u = enu.geodetic2enu(
-  #       anchor[0], anchor[1], anchor[2],
-  #       new_anchor[0], new_anchor[1], new_anchor[2])
-  #   offset[0] += e
-  #   offset[1] += n
-  #   print(f'offset: {offset}')
-
-  # else:
     new_path.anchor = path.anchor
-
-  # create_points(path, new_path, offset, angle)
-  # new_path.annotations = copy.copy(path.annotations)
 
   if args.type:
     if args.type == 'csv':
