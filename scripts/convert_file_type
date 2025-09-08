@@ -401,7 +401,7 @@ if __name__ == "__main__":
      print(f"[error] The file have to be a json file '{args.path_in}': file is not a json format", file=sys.stderr)
 
   new_path = Path()
-  load_file(args.path_in, new_path, 1., 1.0, 0.2, 0.2, with_avoidance=True)
+  load_file(args.path_in, new_path, 1., 1.0, 0.2, 0.2, with_avoidance=False)
 
   offset = [0., 0.]
 
